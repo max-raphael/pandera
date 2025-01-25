@@ -1,7 +1,8 @@
 """Test pandas engine."""
 
-from datetime import date
-from typing import Any, Set
+import datetime as dt
+from typing import Tuple, List, Optional, Any, Set
+from zoneinfo import ZoneInfo
 
 import hypothesis
 import hypothesis.extra.pandas as pd_st
@@ -13,8 +14,9 @@ import pytest
 import pytz
 from hypothesis import given
 
+from pandera import Field, DataFrameModel, errors
 from pandera.engines import pandas_engine
-from pandera.errors import ParserError
+from pandera.errors import ParserError, SchemaError
 
 UNSUPPORTED_DTYPE_CLS: Set[Any] = set()
 
@@ -202,6 +204,141 @@ def test_pandas_datetimetz_dtype(timezone_aware, data, timezone):
         assert coerced_data.dt.tz == timezone
 
 
+def generate_test_cases_timezone_flexible() -> List[
+    Tuple[
+        List[dt.datetime],
+        Optional[dt.tzinfo],
+        bool,
+        List[dt.datetime],
+        bool,
+    ]
+]:
+    """
+    Generate test parameter combinations for a given list of datetime lists.
+
+    Returns:
+        List of tuples:
+        - List of input datetimes
+        - tz for DateTime constructor
+        - coerce flag for Field constructor
+        - expected output datetimes
+        - raises flag (True if an exception is expected, False otherwise)
+    """
+    datetimes = [
+        # multi tz and tz naive
+        [
+            dt.datetime(2023, 3, 1, 4, tzinfo=ZoneInfo("America/New_York")),
+            dt.datetime(2023, 3, 1, 5, tzinfo=ZoneInfo("America/Los_Angeles")),
+            dt.datetime(2023, 3, 1, 5),
+        ],
+        # multiz tz
+        [
+            dt.datetime(2023, 3, 1, 4, tzinfo=ZoneInfo("America/New_York")),
+            dt.datetime(2023, 3, 1, 5, tzinfo=ZoneInfo("America/Los_Angeles")),
+        ],
+        # tz naive
+        [dt.datetime(2023, 3, 1, 4), dt.datetime(2023, 3, 1, 5)],
+        # single tz
+        [
+            dt.datetime(2023, 3, 1, 4, tzinfo=ZoneInfo("America/New_York")),
+            dt.datetime(2023, 3, 1, 5, tzinfo=ZoneInfo("America/New_York")),
+        ],
+    ]
+
+    test_cases = []
+
+    for datetime_list in datetimes:
+        for coerce in [True, False]:
+            for tz in [
+                None,
+                ZoneInfo("America/Chicago"),
+                dt.timezone(dt.timedelta(hours=2)),
+            ]:
+                # Determine if the test should raise an exception
+                # Should raise error when:
+                # * coerce is False but there is a timezone-naive datetime
+                # * coerce is True but tz is not set
+                has_naive_datetime = any(
+                    dt.tzinfo is None for dt in datetime_list
+                )
+                raises = (not coerce and has_naive_datetime) or (
+                    coerce and tz is None
+                )
+
+                # Generate expected output
+                if raises:
+                    expected_output = None  # No expected output since an exception will be raised
+                else:
+                    if coerce:
+                        expected_output_naive = [
+                            dt.replace(tzinfo=tz)
+                            for dt in datetime_list
+                            if dt.tzinfo is None
+                        ]
+                        expected_output_aware = [
+                            dt.astimezone(tz)
+                            for dt in datetime_list
+                            if dt.tzinfo is not None
+                        ]
+                        expected_output = (
+                            expected_output_naive + expected_output_aware
+                        )
+                    else:
+                        # ignore tz
+                        expected_output = datetime_list
+
+                test_case = (
+                    datetime_list,
+                    tz,
+                    coerce,
+                    expected_output,
+                    raises,
+                )
+                test_cases.append(test_case)
+
+    # define final test cases with improper type
+    datetime_list = [
+        dt.datetime(2023, 3, 1, 4, tzinfo=ZoneInfo("America/New_York")),
+        "hello world",
+    ]
+    tz = None
+    expected_output = None
+    raises = True
+
+    bad_type_coerce = (datetime_list, tz, True, expected_output, raises)
+    bad_type_no_coerce = (datetime_list, tz, False, expected_output, raises)
+    test_cases.extend([bad_type_coerce, bad_type_no_coerce])  # type: ignore
+
+    return test_cases  # type: ignore
+
+
+@pytest.mark.parametrize(
+    "examples, tz, coerce, expected_output, raises",
+    generate_test_cases_timezone_flexible(),
+)
+def test_dt_timezone_flexible(examples, tz, coerce, expected_output, raises):
+    """Test that timezone_flexible works as expected"""
+
+    # Testing using a pandera DataFrameModel rather than directly calling dtype coerce or validate because with
+    # timezone_flexible, dtype is set dynamically based on the input data
+    class SimpleSchema(DataFrameModel):
+        # pylint: disable=unexpected-keyword-arg,no-value-for-parameter
+        datetime_column: pandas_engine.DateTime(
+            timezone_flexible=True, tz=tz
+        ) = Field(coerce=coerce)
+
+    data = pd.DataFrame({"datetime_column": examples})
+
+    if raises:
+        with pytest.raises((SchemaError, errors.ParserError)):
+            SimpleSchema.validate(data)
+    else:
+        validated_df = SimpleSchema.validate(data)
+        assert sorted(validated_df["datetime_column"].tolist()) == sorted(
+            expected_output
+        )
+
+
 @hypothesis.settings(max_examples=1000)
 @pytest.mark.parametrize("to_df", [True, False])
 @given(
@@ -225,7 +362,7 @@ def test_pandas_date_coerce_dtype(to_df, data):
         )
 
         assert (
-            coerced_data.applymap(lambda x: isinstance(x, date))
+            coerced_data.applymap(lambda x: isinstance(x, dt.date))
             | coerced_data.isna()
         ).all(axis=None)
         return
@@ -234,7 +371,8 @@ def test_pandas_date_coerce_dtype(to_df, data):
         coerced_data.isna().all() and coerced_data.dtype == "datetime64[ns]"
     )
     assert (
-        coerced_data.map(lambda x: isinstance(x, date)) | coerced_data.isna()
+        coerced_data.map(lambda x: isinstance(x, dt.date))
+        | coerced_data.isna()
     ).all()
 
 
@@ -246,8 +384,8 @@ pandas_arrow_dtype_cases = (
         pyarrow.struct([("foo", pyarrow.int64()), ("bar", pyarrow.string())]),
     ),
     (pd.Series([None, pd.NA, np.nan]), pyarrow.null),
-    (pd.Series([None, date(1970, 1, 1)]), pyarrow.date32),
-    (pd.Series([None, date(1970, 1, 1)]), pyarrow.date64),
+    (pd.Series([None, dt.date(1970, 1, 1)]), pyarrow.date32),
+    (pd.Series([None, dt.date(1970, 1, 1)]), pyarrow.date64),
     (pd.Series([1, 2]), pyarrow.duration("ns")),
     (pd.Series([1, 1e3, 1e6, 1e9, None]), pyarrow.time32("ms")),
     (pd.Series([1, 1e3, 1e6, 1e9, None]), pyarrow.time64("ns")),
@@ -292,8 +430,8 @@ pandas_arrow_dtype_error_cases = (
         pyarrow.struct([("foo", pyarrow.string()), ("bar", pyarrow.int64())]),
     ),
     (pd.Series(["a", "1"]), pyarrow.null),
-    (pd.Series(["a", date(1970, 1, 1), "1970-01-01"]), pyarrow.date32),
-    (pd.Series(["a", date(1970, 1, 1), "1970-01-01"]), pyarrow.date64),
+    (pd.Series(["a", dt.date(1970, 1, 1), "1970-01-01"]), pyarrow.date32),
+    (pd.Series(["a", dt.date(1970, 1, 1), "1970-01-01"]), pyarrow.date64),
     (pd.Series(["a"]), pyarrow.duration("ns")),
     (pd.Series(["a", "b"]), pyarrow.time32("ms")),
     (pd.Series(["a", "b"]), pyarrow.time64("ns")),
